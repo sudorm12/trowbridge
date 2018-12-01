@@ -1,5 +1,5 @@
 ---
-title: "HousingData"
+title: "Cambridge Real Estate Assessments"
 author: "Sean Tierney"
 date: "November 27, 2018"
 output: html_document
@@ -13,14 +13,17 @@ library("tidyverse")
 ## Property Database FY 16-19
 
 ``` {r readDatabaseFile}
+# read assessment database file provided by city of cambridge
 rawPropertyData <- read_delim('Cambridge_Property_Database_FY16-FY19.csv', delim = ',')
 ```
 
 ``` {r propDBSummary}
+# what does the data look like?
 summary(rawPropertyData)
 ```
 
 ``` {r convertDtypes}
+# convert columns to factors where necessary
 factorCols <- c(
   "PID",
   "StateClassCode",
@@ -50,21 +53,33 @@ propertyData <- rawPropertyData %>% mutate_at(factorCols, as.factor)
 ```
 
 ``` {r plotAssessedValues}
+# what is the overall distribution of assessed values?
 ggplot(propertyData, aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10()
 ```
 
 ``` {r plotYearOfAssessment}
+# what is the distribution of years of assessment?
 ggplot(propertyData, aes(x = YearOfAssessment)) + geom_histogram()
+
+# what about outside of a sane range?
 propertyData %>% filter(YearOfAssessment > 2019 | YearOfAssessment <= 1900) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram()
+
+# in a sane range?
 propertyData %>% filter(YearOfAssessment > 1990 & YearOfAssessment <= 2019) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram()
 ```
 
+There's a good amount of records with garbage "year of assessment" values
+
 ``` {r numberOfAssessments}
-propertyData %>% count(PID) %>% arrange(desc(n)) %>% head(n = 15) %>% ggplot(aes(x = reorder(PID, n), y = n)) + geom_bar(stat = "identity") + xlab("Property ID") + ylab("Number of Assessments")
+# which property ids appear the most?
+propertyData %>% count(PID) %>% arrange(desc(n)) %>% head(n = 15) %>% 
+  ggplot(aes(x = reorder(PID, n), y = n)) + geom_bar(stat = "identity") + 
+  xlab("Property ID") + ylab("Number of Assessments")
 ```
 
 
 ``` {r highAssessmentPropertyDetail}
+# what do the assessed properties look like from the three most common property ids?
 propertyData %>% filter(PID == 11716)
 propertyData %>% filter(PID == 21897)
 propertyData %>% filter(PID == 12630)
@@ -73,13 +88,31 @@ propertyData %>% filter(PID == 12630)
 Found Harvard and MIT!
 
 ``` {r whichPropertyClasses}
+# what are the most common types of properties?
 propertyData %>% count(PropertyClass) %>% arrange(desc(n))
 propertyData %>% count(PropertyClass) %>% arrange(desc(n)) %>% head(n = 10) %>% ggplot(aes(x = reorder(PropertyClass, n), y = n)) + geom_bar(stat = "identity") + xlab("Property Class") + ylab("Number of Assessments")
 ```
 
 ``` {r singleResUnit}
-singleResUnitData <- propertyData %>% filter(PropertyClass == "CONDOMINIUM" | PropertyClass == "SNGL-FAM-RES" | PropertyClass == "CNDO LUX")
+# let's look at just single unit residential properties
+singleResUnitData <- propertyData %>% 
+  filter(
+    PropertyClass == "CONDOMINIUM" | PropertyClass == "SNGL-FAM-RES" | PropertyClass == "CNDO LUX"
+    )
+
+# looking at only maximum assessed value for each property, how much does
+# the number of bedrooms affect assessed value?
 singleResUnitData %>% group_by(PID) %>% summarize_if(is.numeric, max) %>% 
   filter(AssessedValue > 0) %>% filter(Interior_Bedrooms <= 3) %>%
-  ggplot(aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10() + facet_grid(Interior_Bedrooms ~ .)
+  ggplot(aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10() + 
+  facet_grid(Interior_Bedrooms ~ ., scales = "free_y")
 ```
+
+``` {r saleVersusAssessed}
+# what do single unit residential properties with a rational sale price
+# sell for compared to assessed value?
+singleResUnitData %>% filter(SalePrice > 100) %>%
+  ggplot(aes(x = AssessedValue, y = SalePrice, col = Interior_Bedrooms)) + 
+  geom_point() + scale_x_log10() + scale_y_log10()
+```
+
