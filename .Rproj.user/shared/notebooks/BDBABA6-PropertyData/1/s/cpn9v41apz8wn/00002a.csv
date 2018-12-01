@@ -1,0 +1,1 @@
+"0","propertyData %>% filter(YearOfAssessment > 2019 | YearOfAssessment <= 1900) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram()"

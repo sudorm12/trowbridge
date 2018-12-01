@@ -1,0 +1,1 @@
+"0","ggplot(propertyData, aes(x = YearOfAssessment)) + geom_histogram(binwidth = 1)"
