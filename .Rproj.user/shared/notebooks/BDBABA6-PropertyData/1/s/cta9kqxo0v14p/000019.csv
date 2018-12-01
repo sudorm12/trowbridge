@@ -1,1 +1,0 @@
-"0","ggplot(propertyData, aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10()"

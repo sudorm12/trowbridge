@@ -1,1 +1,0 @@
-"0","propertyData %>% count(PropertyClass) %>% arrange(desc(n)) %>% head(n = 10) %>% ggplot(aes(x = reorder(PropertyClass, n), y = n)) + geom_bar(stat = ""identity"") + xlab(""Property Class"") + ylab(""Number of Assessments"")"

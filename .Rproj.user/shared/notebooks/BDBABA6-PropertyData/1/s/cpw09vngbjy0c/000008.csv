@@ -1,1 +1,0 @@
-"0","propertyData %>% count(PropertyClass) %>% arrange(desc(n))"
