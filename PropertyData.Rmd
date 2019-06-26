@@ -2,28 +2,102 @@
 title: "Cambridge Real Estate Assessments"
 author: "Sean Tierney"
 date: "November 27, 2018"
-output: html_document
+output: 
+  html_document:
+    toc: true
+    df_print: paged
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-library("tidyverse")
+library(tidyverse)
+library(stringi)
+library(knitr)
+library(lubridate)
+library(rstan)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
 ```
 
 ## Property Database FY 16-19
 
+First let's import the FY16-FY19 property assessment data, provided by the City of Cambridge.
+
 ``` {r readDatabaseFile}
-# read assessment database file provided by city of cambridge
-rawPropertyData <- read_delim('Cambridge_Property_Database_FY16-FY19.csv', delim = ',')
+rawPropertyData <- read_delim('Cambridge_Property_Database_FY16-FY19.csv', delim = ',', guess_max = 10000)
+# importProblems <- problems(rawPropertyData <- read_delim('Cambridge_Property_Database_FY16-FY19.csv', delim = ','))
 ```
 
+It's having some difficulty importing the Property Tax Amount as the first few thousand records are all integers, and so it infers an integer type. I've tried playing around with the `guess_max` option of read_delim to no avail. For now it's not really a big deal.
+
+## Summary of Raw Data
+
+Let's take a look at what the data looks like.
+
 ``` {r propDBSummary}
-# what does the data look like?
 summary(rawPropertyData)
 ```
 
+Obviously there are a lot of variables here. I'll explore many of these in more detail later, but some obvious things jump out at a glance. First, there are a lot of string values which should probably be coded as factors. This will make analysis a little bit easier. Second, there are definitely some garbage values in here. Property Tax Amount jumps out at the end here with more than half of properties showing a value of -1. And there are plenty of other weird values as well, such as basement sizes in the negatives, a Year Built of zero, one building with 374,995 units? That just seems implausible.
+
+## Raw Data Scrutiny
+
+### YearOfAssessment
+
+What do the values for `YearOfAssessment` look like?
+
+``` {r plotYearOfAssessment}
+ggplot(rawPropertyData, aes(x = YearOfAssessment)) + geom_histogram(bins = 50)
+```
+
+That doesn't look right. What do values look like outside of a sane range?
+
+``` {r}
+rawPropertyData %>% filter(YearOfAssessment > 2019 | YearOfAssessment <= 1900) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram(bins = 50)
+```
+
+And what about in a sane range?
+
+``` {r}
+rawPropertyData %>% filter(YearOfAssessment > 1900 & YearOfAssessment <= 2019) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram(binwidth = 1)
+```
+
+Okay, so clearly there are a good amount of records with garbage values. How many exactly?
+
+``` {r}
+rawPropertyData %>% transmute(SaneYOA = YearOfAssessment > 1990 & YearOfAssessment <= 2019) %>% count(SaneYOA)
+```
+
+In the scheme of things, not so many. We can decide later if it makes sense to drop these rows or just replace with some sort of NA value.
+
+Now, let's take a look at the date of sale.
+
+``` {r}
+rawPropertyData %>% select(SaleDate) %>% head(20)
+```
+
+Okay, there is obviously something strange happening here. Several have the date 01/05/0001. To me that looks like a code for unknown date. Others are dated 01/01/xxxxx where xxxxx is some very large number, usually in the 30,000 to 40,000 range. I'm guessing that's the number of days since 1900.
+
+``` {r}
+rawPropertyData %>% select(SaleDate) %>% mutate(chars = str_length(SaleDate)) %>% filter(chars == 10) %>% count(SaleDate) %>% arrange(desc(n))
+```
+
+It appears another code for unknown date is 01/01/1900. I'm not quite sure what's going on with 01/01/1998, that seems a little suspicious. Are there any sales before 1900?
+
+``` {r}
+rawPropertyData %>% mutate(SaleYear = as.integer(stri_extract_last_regex(SaleDate, "[0-9]{4,5}"))) %>% filter(SaleYear > 1 & SaleYear < 1900) %>% select(Owner_Name, SaleDate, Address)
+```
+
+Just some City of Cambridge properties, and the dates look legitimate. So, we can take any large years and convert them to dates and perhaps set dates with years less than 1800 to NA.
+
+## Data Cleanup
+
+### Strings to Factors
+
+Let's start small and convert those string values into factors.
+
 ``` {r convertDtypes}
-# convert columns to factors where necessary
 factorCols <- c(
   "PID",
   "StateClassCode",
@@ -52,34 +126,49 @@ factorCols <- c(
 propertyData <- rawPropertyData %>% mutate_at(factorCols, as.factor)
 ```
 
-``` {r plotAssessedValues}
-# what is the overall distribution of assessed values?
-ggplot(propertyData, aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10()
+Now let's get a shorter representation of the address and GPS coordinates from the `Address` field.
+
+``` {r}
+# propertyData %>% select(Address) %>% mutate(loc = regmatches(Address, regexpr("\\(.*\\)", Address)))
+
+propertyData <- propertyData %>% mutate(
+  GPSLoc = stri_extract_last_regex(Address, "\\(.*\\)"),
+  ShortAddress = str_remove(Address, "\\n.*\\n.*"))
 ```
 
-``` {r plotYearOfAssessment}
-# what is the distribution of years of assessment?
-ggplot(propertyData, aes(x = YearOfAssessment)) + geom_histogram()
+Let's correct those bogus-looking dates.
 
-# what about outside of a sane range?
-propertyData %>% filter(YearOfAssessment > 2019 | YearOfAssessment <= 1900) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram()
+``` {r}
+# create a date object at Jan 1 1900 as reference for corrected dates
+baseDate <- as_date("01/01/1900", tz = "UTC", format = "%m/%d/%Y")
 
-# in a sane range?
-propertyData %>% filter(YearOfAssessment > 1990 & YearOfAssessment <= 2019) %>% ggplot(aes(x = YearOfAssessment)) + geom_histogram()
+propertyData <- propertyData %>%
+  mutate(SaleYear = as.integer(stri_extract_last_regex(SaleDate, "[0-9]{4,5}"))) %>% 
+  mutate(SaleDate = na_if(SaleDate, "01/05/0001")) %>% 
+  mutate(SaleDate = na_if(SaleDate, "01/01/1900")) %>%
+  mutate(SaleDate = if_else(
+    SaleYear > 2100, 
+    baseDate + as.period(SaleYear, unit = "days"), 
+    as_date(SaleDate, tz = "UTC", format = "%m/%d/%Y")))
+
+propertyData %>% count(SaleDate) %>% arrange(desc(n))
 ```
 
-There's a good amount of records with garbage "year of assessment" values
+## Data Exploration
+
+### Property ID
+
+Which property ids appear the most?
 
 ``` {r numberOfAssessments}
-# which property ids appear the most?
 propertyData %>% count(PID) %>% arrange(desc(n)) %>% head(n = 15) %>% 
   ggplot(aes(x = reorder(PID, n), y = n)) + geom_bar(stat = "identity") + 
   xlab("Property ID") + ylab("Number of Assessments")
 ```
 
+What do the assessed properties look like from the three most common property ids?
 
 ``` {r highAssessmentPropertyDetail}
-# what do the assessed properties look like from the three most common property ids?
 propertyData %>% filter(PID == 11716)
 propertyData %>% filter(PID == 21897)
 propertyData %>% filter(PID == 12630)
@@ -87,11 +176,40 @@ propertyData %>% filter(PID == 12630)
 
 Found Harvard and MIT!
 
-``` {r whichPropertyClasses}
-# what are the most common types of properties?
-propertyData %>% count(PropertyClass) %>% arrange(desc(n))
-propertyData %>% count(PropertyClass) %>% arrange(desc(n)) %>% head(n = 10) %>% ggplot(aes(x = reorder(PropertyClass, n), y = n)) + geom_bar(stat = "identity") + xlab("Property Class") + ylab("Number of Assessments")
+### Assessed Value
+
+What is the overall distribution of `AssessedValue`?
+
+``` {r plotAssessedValues}
+ggplot(propertyData, aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10()
 ```
+
+What are the most valuable properties (by assessment) in Cambridge?
+
+``` {r}
+propertyData %>% arrange(desc(AssessedValue)) %>% select(PID, Owner_Name, ShortAddress, AssessedValue, Exterior_Style) %>% head(20)
+```
+
+Okay, that's a boring answer. Of course the university properties are worth a billion dollars. What about excepting universities and colleges?
+
+``` {r}
+propertyData %>% arrange(desc(AssessedValue)) %>% filter(PropertyClass != "Private College, University" & PropertyClass != "Private College") %>% select(PID, Owner_Name, ShortAddress, AssessedValue, PropertyClass, Exterior_Style) %>% head(100)# %>% kable()
+```
+
+545 Technology Squre on top with \$453M and \$395M. Novartis also sitting on some valuable real estate. Some interesting properties lower in the data, such as the vacant utility authorities at \#23 and \#29, worth \$305M and \$274M. Residential property starts pretty low down the list at \#51 and \$226M, one of the Twenty20 buildings.
+
+### Property Class
+
+What are the most common types of properties?
+
+``` {r whichPropertyClasses}
+propertyData %>% count(PropertyClass) %>% arrange(desc(n))
+propertyData %>% count(PropertyClass) %>% arrange(desc(n)) %>% head(n = 10) %>% ggplot(aes(x = reorder(PropertyClass, n), y = n)) + geom_bar(stat = "identity") + xlab("Property Class") + ylab("Number of Assessments") + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Diving Into Single Family Residential Data
+
+Okay, let's just take a look at single family residential properties.
 
 ``` {r singleResUnit}
 # let's look at just single unit residential properties
@@ -99,7 +217,64 @@ singleResUnitData <- propertyData %>%
   filter(
     PropertyClass == "CONDOMINIUM" | PropertyClass == "SNGL-FAM-RES" | PropertyClass == "CNDO LUX"
     )
+```
 
+### Highest Valued Single Family Properties
+
+``` {r singleResNumberOfUnits}
+singleResUnitData %>% count(Interior_NumUnits)
+```
+
+What are the most valuable single family properties in the city?
+
+``` {r}
+singleResUnitData %>% arrange(desc(AssessedValue)) %>% filter(YearOfAssessment == 2018) %>% select(PID, Owner_Name, ShortAddress, AssessedValue, PropertyClass, Exterior_Style) %>% head(100)
+```
+
+The addresses sound about right.
+
+### Number of Assessments
+
+How many assessments were performed each year?
+
+``` {r}
+singleResUnitData %>% count(YearOfAssessment)
+```
+
+How many assessments are available for each property?
+
+``` {r singleResNumberAssessments}
+singleResUnitData %>% count(PID) %>% ggplot(aes(x = n)) + geom_histogram()
+```
+
+The vast majority have four assessments. Let's create a tbl of all of the properties with four assessments.
+
+``` {r}
+singleResFourAssessmentPIDs <- singleResUnitData %>% 
+  count(PID) %>% filter(n == 4) %>% select(PID)
+singleResFourAssessments <- inner_join(singleResUnitData, singleResFourAssessmentPIDs)
+```
+
+### Year Over Year Assessed Value
+
+``` {r singleResYoYAssessedValue}
+singleResYoYAssessedValue <- singleResFourAssessments %>% 
+  select(PID, AssessedValue, YearOfAssessment) %>% 
+  spread(YearOfAssessment, AssessedValue)
+
+# singleResFourAssessments %>% ggplot(aes(x = YearOfAssessment, y = AssessedValue, group = PID)) + geom_line() + scale_y_log10()
+singleResFourAssessments %>% ggplot(aes(x = YearOfAssessment, group = YearOfAssessment, y = AssessedValue)) + geom_boxplot() + scale_y_log10()
+
+singleResFourAssessments %>% group_by(YearOfAssessment) %>% summarize(mean(AssessedValue))
+```
+
+``` {r singleResSalePrice}
+singleResFourAssessments %>% select(PID, SalePrice, YearOfAssessment) %>% spread(YearOfAssessment, SalePrice)
+
+singleResFourAssessments %>% group_by(PID) %>% summarize(std = sd(SalePrice) + 1e-5) %>% ggplot(aes(x = std)) + geom_histogram(bins = 50) + scale_x_log10()
+```
+
+``` {r}
 # looking at only maximum assessed value for each property, how much does
 # the number of bedrooms affect assessed value?
 singleResUnitData %>% group_by(PID) %>% summarize_if(is.numeric, max) %>% 
@@ -107,6 +282,16 @@ singleResUnitData %>% group_by(PID) %>% summarize_if(is.numeric, max) %>%
   ggplot(aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10() + 
   facet_grid(Interior_Bedrooms ~ ., scales = "free_y")
 ```
+
+``` {r}
+# looking at only maximum assessed value for each property, how much does
+# the number of bedrooms affect assessed value?
+singleResUnitData %>% group_by(PID) %>% summarize_if(is.numeric, max) %>% 
+  filter(AssessedValue > 0) %>% filter(Interior_Bedrooms <= 3) %>%
+  ggplot(aes(x = AssessedValue)) + geom_histogram(bins = 50) +
+  scale_x_log10()
+```
+
 
 ``` {r saleVersusAssessed}
 # what do single unit residential properties with a rational sale price
@@ -116,3 +301,379 @@ singleResUnitData %>% filter(SalePrice > 100) %>%
   geom_point() + scale_x_log10() + scale_y_log10()
 ```
 
+``` {r fireplaceValue}
+singleResUnitData %>% group_by(PID) %>% summarize_if(is.numeric, max) %>% 
+  filter(AssessedValue > 0) %>% mutate(Has_Fireplace = Interior_Fireplaces > 0) %>%
+  ggplot(aes(x = AssessedValue)) + geom_histogram(bins = 50) + scale_x_log10() +
+  facet_grid(Has_Fireplace ~ ., scales = "free_y")
+```
+
+### Time From Last Sale
+
+``` {r}
+singleResUnitData %>% filter(YearOfAssessment == 2018) %>% 
+  mutate(YearsSinceSold = 2018 - year(SaleDate)) %>% filter(YearsSinceSold > 0) %>%
+  ggplot(aes(x = YearsSinceSold)) + geom_histogram(binwidth = 1)
+```
+
+### Predicting Sale Price
+
+Let's initially look at properties listed as sold in 2014. I'll use the 2016 assessments as they appear to be the most complete. I'll also filter out extremely low valued sales although it may be interesting to see if we can classify when that type of sale will happen.
+
+``` {r}
+singleResUnitData %>% filter(YearOfAssessment == 2016) %>% filter(year(SaleDate) == 2014)
+```
+
+``` {r}
+singleResUnitData %>% filter(YearOfAssessment == 2016) %>% filter(year(SaleDate) == 2014) %>% select_if(is.numeric) %>% summarise_all(sd) %>% t()
+```
+
+Some of these standard deviations are coming up NA or zero so we'll have to cull them (for now at least) to get rational results.
+
+``` {r}
+singleResSaleTrain <- singleResUnitData %>% 
+  filter(YearOfAssessment == 2016) %>% filter(year(SaleDate) == 2014) %>% 
+  filter(SalePrice > 1000) %>% 
+  mutate(Interior_TotalRooms = recode(Interior_TotalRooms, `0` = 1),
+         InUnitWD = Interior_LaundryInUnit == 1) %>%
+  select(-c(BldgNum, YearOfAssessment, Exterior_WallHeight, Exterior_FloorLocation,
+            Interior_NumUnits, PropertyTaxAmount, Parking_Garage, SaleYear))
+```
+
+``` {r}
+singleResSaleTrain %>% select_if(is.numeric) %>% cor() %>% .[,"SalePrice"] %>% sort(decreasing = TRUE)
+```
+
+As expected, AssessedValue and PreviousAssessedValue have very high correlation to the sale price. Interior_LivingArea is very highly correlated as well which shouldn't be too surprising. 
+
+``` {r}
+for (factorCol in factorCols) {
+  if (factorCol != "PID") {
+    print(factorCol)
+    singleResSaleTrain %>% select(PID, SalePrice, factorCol) %>% mutate(one = 1) %>% spread(factorCol, one, fill = 0) %>% select(-PID) %>% cor() %>% .[,"SalePrice"] %>% sort(decreasing = TRUE) %>% print()
+  }
+}
+```
+
+There are quite a few interesting results here! One that jumps out immediately is that the conditions and grades don't necessarily go in order. An interior condition of "Very Good" is less correlated with a high sale price than a condition of "Good". It's pretty obvious there are some correlations between that feature and other features which are skewing the correlations. It's also unclear how many properties actually were given each ranking. In fact, let's count up the instance of each level of the factor features.
+
+``` {r}
+# singleResSaleTrain %>% select(-PID) %>% select_if(is.factor) %>% sum()
+for (factorCol in factorCols) {
+  if (factorCol != "PID") {
+    print(factorCol)
+    singleResSaleTrain %>% select(factorCol) %>% count()
+    # singleResSaleTrain %>% select(PID, SalePrice, factorCol) %>% mutate(one = 1) %>% spread(factorCol, one, fill = 0) %>% select(-PID) %>% cor() %>% .[,"SalePrice"] %>% sort(decreasing = TRUE) %>% print()
+  }
+}
+```
+
+``` {r}
+singleResSaleTrain %>% group_by(Exterior_Style) %>% tally() %>% arrange(desc(n))
+```
+
+I think there may be some correlations between building materials and style. Let's see how serious they are.
+
+``` {r}
+singleResSaleTrain %>% group_by(Exterior_Style, Exterior_WallType) %>% tally() %>% arrange(desc(n))
+```
+
+Actually, it appears the vast majority of sales are of apartments, flats, townhouses, etc which do not have exterior walls or they are not recorded. 
+
+``` {r}
+singleResSaleTrain %>% group_by(Exterior_Style, Exterior_occupancy) %>% tally() %>% arrange(Exterior_Style, desc(n))
+```
+
+``` {r}
+singleResSaleTrain %>% group_by(Exterior_occupancy, Exterior_RoofType) %>% tally() %>% arrange(Exterior_RoofType)
+```
+
+``` {r}
+singleResSaleTrain %>% filter(as.character(Exterior_occupancy) != "SNGL-FAM-RES" | is.na(Exterior_occupancy))# %>% summarize_all(funs(sum(is.na(.)))) %>% t()
+```
+
+``` {r}
+for (factorCol in factorCols) {
+  if (factorCol != "PID") {
+    print(factorCol)
+    singleResSaleTrain %>% 
+      filter(as.character(Exterior_occupancy) == "SNGL-FAM-RES") %>% 
+      select(PID, SalePrice, factorCol) %>% mutate(one = 1) %>% 
+      spread(factorCol, one, fill = 0) %>% select(-PID) %>% 
+      cor() %>% .[,"SalePrice"] %>% sort(decreasing = TRUE) %>% 
+      print()
+  }
+}
+```
+
+``` {r}
+for (factorCol in factorCols) {
+  if (factorCol != "PID") {
+    print(factorCol)
+    singleResSaleTrain %>% 
+      filter(as.character(Exterior_occupancy) != "SNGL-FAM-RES" | is.na(Exterior_occupancy)) %>% 
+      select(PID, SalePrice, factorCol) %>% mutate(one = 1) %>% 
+      spread(factorCol, one, fill = 0) %>% select(-PID) %>% 
+      cor() %>% .[,"SalePrice"] %>% sort(decreasing = TRUE) %>% 
+      print()
+  }
+}
+```
+
+``` {r}
+singleResSaleTrain %>% 
+  filter(as.character(Exterior_occupancy) == "SNGL-FAM-RES") %>% 
+  select_if(is.numeric) %>% cor() %>% .[,"SalePrice"] %>% sort(decreasing = TRUE)
+```
+
+``` {r}
+singleResSaleTrain %>% 
+  filter(as.character(Exterior_occupancy) != "SNGL-FAM-RES" | is.na(Exterior_occupancy)) %>% 
+  select_if(is.numeric) %>% select(-c(LandArea, LandValue)) %>% cor() %>% .[,"SalePrice"] %>% 
+  sort(decreasing = TRUE)
+```
+
+``` {r}
+singleResSaleTrain %>% 
+  filter(as.character(Exterior_occupancy) == "SNGL-FAM-RES") %>% 
+  select(SalePrice, Interior_Fireplaces) %>%
+  mutate(Has_Fireplace = Interior_Fireplaces > 0, 
+         TwoPlus_FP = Interior_Fireplaces > 1,
+         Multi_FP = Interior_Fireplaces > 2) %>%
+  cor() %>% .[,"SalePrice"] %>% 
+  sort(decreasing = TRUE)
+```
+
+I think it makes sense to try developing two seperate models for sale price before attempting to combine the two.
+
+## Modeling Attached Single Family Sale Values
+
+``` {r}
+asfTrain <- singleResSaleTrain %>% 
+  filter(as.character(Exterior_occupancy) != "SNGL-FAM-RES" | is.na(Exterior_occupancy))
+
+head(asfTrain)
+```
+
+``` {stan output.var = "att_area"}
+data {
+  int<lower=0> n;
+  real area[n];
+  real sale_price[n];
+}
+parameters {
+  real a;
+  real b_area;
+  real<lower=0> sig;
+}
+model {
+  a ~ normal(500000, 10000);
+  b_area ~ normal(0, 10);
+  sig ~ cauchy(0, 10);
+  
+  for (i in 1:n) {
+    sale_price ~ normal(a + b_area * area[i], sig);
+  }
+}
+```
+
+``` {r}
+subset_train <- asfTrain[1:500,]
+
+prop_dat <- list(
+  n = nrow(subset_train),
+  area = as.numeric(subset_train$Interior_LivingArea),
+  rooms = subset_train$Interior_TotalRooms,
+  bedrooms = subset_train$Interior_Bedrooms,
+  halfbaths = subset_train$Interior_HalfBaths,
+  fullbaths = subset_train$Interior_FullBaths,
+  sale_price = subset_train$SalePrice
+)
+
+att_area_fit <- sampling(att_area, data = prop_dat)
+```
+
+``` {r}
+print(att_area_fit)
+```
+
+``` {r}
+plot(att_area_fit)
+```
+
+``` {stan output.var = "att_rooms"}
+data {
+  int<lower=0> n;
+  real rooms[n];
+  real bedrooms[n];
+  real sale_price[n];
+}
+transformed data {
+  real otherrooms[n];
+  for (i in 1:n) {
+    otherrooms[i] = rooms[i] - bedrooms[i];
+  }
+}
+parameters {
+  real a;
+  real b_bedrooms;
+  real b_otherrooms;
+  real<lower=0> sig;
+}
+model {
+  a ~ normal(500000, 10000);
+  b_bedrooms ~ normal(0, 10000);
+  b_otherrooms ~ normal(0, 10000);
+  sig ~ cauchy(0, 10);
+  
+  for (i in 1:n) {
+    sale_price ~ normal(a + b_bedrooms * bedrooms[i] + b_otherrooms * otherrooms[i], sig);
+  }
+}
+```
+
+
+``` {r}
+subset_train <- asfTrain[1:500,]
+
+prop_dat <- list(
+  n = nrow(subset_train),
+  area = as.numeric(subset_train$Interior_LivingArea),
+  rooms = subset_train$Interior_TotalRooms,
+  bedrooms = subset_train$Interior_Bedrooms,
+  halfbaths = subset_train$Interior_HalfBaths,
+  fullbaths = subset_train$Interior_FullBaths,
+  sale_price = subset_train$SalePrice
+)
+
+att_rooms_fit <- sampling(att_rooms, data = prop_dat)
+```
+
+``` {r}
+print(att_rooms_fit)
+```
+
+``` {stan output.var = "att_rooms_area"}
+data {
+  int<lower=0> n;
+  real rooms[n];
+  real bedrooms[n];
+  real area[n];
+  real sale_price[n];
+}
+transformed data {
+  real otherrooms[n];
+  real roomsize[n];
+  for (i in 1:n) {
+    otherrooms[i] = rooms[i] - bedrooms[i];
+    roomsize[i] = area[i] / rooms[i];
+  }
+}
+parameters {
+  real a;
+  real b_bedrooms;
+  real b_otherrooms;
+  real b_roomsize;
+  real<lower=0> sig;
+}
+model {
+  a ~ normal(500000, 10000);
+  b_bedrooms ~ normal(0, 10000);
+  b_otherrooms ~ normal(0, 10000);
+  b_roomsize ~ normal(0, 1000);
+  sig ~ cauchy(0, 10);
+  
+  for (i in 1:n) {
+    sale_price ~ normal(a + b_bedrooms * bedrooms[i] + b_otherrooms * otherrooms[i] + b_roomsize * roomsize[i], sig);
+  }
+}
+```
+
+
+``` {r, echo = FALSE}
+subset_train <- asfTrain[1:700,]
+
+prop_dat <- list(
+  n = nrow(subset_train),
+  area = as.numeric(subset_train$Interior_LivingArea),
+  rooms = subset_train$Interior_TotalRooms,
+  bedrooms = subset_train$Interior_Bedrooms,
+  halfbaths = subset_train$Interior_HalfBaths,
+  fullbaths = subset_train$Interior_FullBaths,
+  sale_price = subset_train$SalePrice
+)
+
+att_rooms_area_fit <- sampling(att_rooms_area, data = prop_dat)
+```
+
+``` {r}
+print(att_rooms_area_fit)
+```
+
+``` {stan output.var = "att_rooms_area_wd"}
+data {
+  int<lower=0> n;
+  real rooms[n];
+  real bedrooms[n];
+  real area[n];
+  real sale_price[n];
+  real wd[n];
+}
+transformed data {
+  real otherrooms[n];
+  real roomsize[n];
+  for (i in 1:n) {
+    otherrooms[i] = rooms[i] - bedrooms[i];
+    roomsize[i] = area[i] / rooms[i];
+  }
+}
+parameters {
+  real a;
+  real b_bedrooms;
+  real b_otherrooms;
+  real b_roomsize;
+  real b_wd;
+  real<lower=0> sig;
+}
+model {
+  a ~ normal(500000, 10000);
+  b_bedrooms ~ normal(0, 10000);
+  b_otherrooms ~ normal(0, 10000);
+  b_roomsize ~ normal(0, 1000);
+  b_wd ~ normal(0, 1000);
+  sig ~ cauchy(0, 10);
+  
+  for (i in 1:n) {
+    sale_price ~ normal(a + b_bedrooms * bedrooms[i] + b_otherrooms * otherrooms[i] + b_roomsize * roomsize[i] + b_wd * wd[i], sig);
+  }
+}
+```
+
+
+``` {r, echo = FALSE}
+subset_train <- asfTrain[1:200,]
+
+prop_dat <- list(
+  n = nrow(subset_train),
+  area = as.numeric(subset_train$Interior_LivingArea),
+  rooms = subset_train$Interior_TotalRooms,
+  bedrooms = subset_train$Interior_Bedrooms,
+  halfbaths = subset_train$Interior_HalfBaths,
+  fullbaths = subset_train$Interior_FullBaths,
+  wd = subset_train$InUnitWD,
+  sale_price = subset_train$SalePrice
+)
+
+att_rooms_area_wd_fit <- sampling(att_rooms_area_wd, data = prop_dat)
+```
+
+``` {r}
+print(att_rooms_area_wd_fit)
+```
+
+## Visualizing Property Locations
+
+``` {r plotPropertyLocations}
+# what are the physical locations of properties?
+
+```
